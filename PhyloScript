@@ -1,0 +1,435 @@
+#!/bin/bash
+# Complete BUSCO-based phylogenomics pipeline for liverworts
+# Author: Generated for Kamil Koczwara
+# Date: 2024
+
+set -e  # Exit on error
+
+# Configuration
+THREADS=16
+BUSCO_DB="embryophyta_odb10"
+WORKING_DIR="/home/kamil-koczwara/phylogenomics_project"
+CONDA_ENV="phylogeny_env"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored status messages
+print_status() {
+    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Check if we're in the right directory
+if [ "$PWD" != "$WORKING_DIR" ]; then
+    print_status "Changing to working directory: $WORKING_DIR"
+    cd "$WORKING_DIR"
+fi
+
+# Check if conda environment is activated
+if [ "$CONDA_DEFAULT_ENV" != "$CONDA_ENV" ]; then
+    print_error "Please activate the conda environment first: conda activate $CONDA_ENV"
+    exit 1
+fi
+
+# Step 1: Run BUSCO on all genomes
+print_status "Step 1: Running BUSCO analysis on all genomes"
+mkdir -p busco_results
+
+# Count total genomes
+total_genomes=$(ls *.fasta 2>/dev/null | wc -l)
+if [ "$total_genomes" -eq 0 ]; then
+    print_error "No FASTA files found in current directory!"
+    exit 1
+fi
+
+print_status "Found $total_genomes genome files"
+
+# Download BUSCO database if not exists
+if [ ! -d "$HOME/.busco/downloads/lineages/$BUSCO_DB" ]; then
+    print_status "Downloading BUSCO database: $BUSCO_DB"
+    busco --download $BUSCO_DB
+fi
+
+# Run BUSCO on each genome
+counter=0
+for genome in *.fasta; do
+    counter=$((counter + 1))
+    name=$(basename "$genome" .fasta)
+    print_status "Processing genome $counter/$total_genomes: $name"
+    
+    if [ -d "busco_results/${name}_busco" ]; then
+        print_warning "BUSCO results already exist for $name, skipping..."
+        continue
+    fi
+    
+    busco -i "$genome" \
+          -o "${name}_busco" \
+          -m genome \
+          -l "$BUSCO_DB" \
+          -c "$THREADS" \
+          -f \
+          --out_path busco_results/ \
+          --quiet
+done
+
+# Step 2: Extract common single-copy orthologs
+print_status "Step 2: Extracting common single-copy orthologs"
+
+cat > extract_busco_orthologs.py << 'EOF'
+#!/usr/bin/env python3
+import os
+import glob
+from collections import defaultdict
+
+busco_dir = "busco_results"
+output_dir = "busco_phylogeny"
+os.makedirs(output_dir, exist_ok=True)
+
+# Find all completed BUSCO analyses
+summaries = glob.glob(f"{busco_dir}/*/short_summary.*.txt")
+print(f"Found {len(summaries)} completed BUSCO analyses")
+
+# Collect ortholog information
+species_orthologs = defaultdict(set)
+all_species = set()
+
+for summary in summaries:
+    species = summary.split("/")[-2].replace("_busco", "")
+    all_species.add(species)
+    
+    busco_seq_dir = os.path.join(os.path.dirname(summary), 
+                                  "run_" + os.environ.get("BUSCO_DB", "embryophyta_odb10"), 
+                                  "busco_sequences", 
+                                  "single_copy_busco_sequences")
+    
+    if os.path.exists(busco_seq_dir):
+        orthologs = [f.replace(".faa", "") for f in os.listdir(busco_seq_dir) 
+                     if f.endswith(".faa")]
+        species_orthologs[species] = set(orthologs)
+        print(f"{species}: {len(orthologs)} single-copy orthologs")
+
+# Find orthologs common to all species
+common_orthologs = set.intersection(*species_orthologs.values()) if species_orthologs else set()
+print(f"\nFound {len(common_orthologs)} orthologs common to all {len(all_species)} species")
+
+# Save list
+with open(f"{output_dir}/common_orthologs.txt", "w") as f:
+    for orth in sorted(common_orthologs):
+        f.write(f"{orth}\n")
+
+print(f"Ortholog list saved to {output_dir}/common_orthologs.txt")
+EOF
+
+BUSCO_DB=$BUSCO_DB python3 extract_busco_orthologs.py
+
+# Check if we have enough orthologs
+ortholog_count=$(wc -l < busco_phylogeny/common_orthologs.txt)
+if [ "$ortholog_count" -lt 50 ]; then
+    print_warning "Only $ortholog_count common orthologs found. This might be too few for reliable phylogeny."
+    read -p "Continue anyway? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# Step 3: Extract and prepare sequences
+print_status "Step 3: Extracting sequences for each ortholog"
+
+cat > prepare_alignments.py << 'EOF'
+#!/usr/bin/env python3
+import os
+import glob
+from Bio import SeqIO
+
+busco_dir = "busco_results"
+output_dir = "busco_phylogeny"
+orthologs_dir = f"{output_dir}/individual_orthologs"
+os.makedirs(orthologs_dir, exist_ok=True)
+
+# Read common orthologs
+with open(f"{output_dir}/common_orthologs.txt") as f:
+    common_orthologs = [line.strip() for line in f]
+
+print(f"Preparing {len(common_orthologs)} orthologs...")
+
+# Get species count
+species_dirs = glob.glob(f"{busco_dir}/*_busco")
+species_count = len(species_dirs)
+
+# For each ortholog
+successful_orthologs = 0
+for i, ortholog in enumerate(common_orthologs):
+    if i % 50 == 0:
+        print(f"Processing ortholog {i+1}/{len(common_orthologs)}")
+    
+    sequences = []
+    
+    # Collect sequences from all species
+    for species_dir in species_dirs:
+        species = os.path.basename(species_dir).replace("_busco", "")
+        
+        # Look for protein sequence
+        faa_path = os.path.join(species_dir, "run_" + os.environ.get("BUSCO_DB", "embryophyta_odb10"), 
+                                "busco_sequences", "single_copy_busco_sequences", 
+                                f"{ortholog}.faa")
+        
+        if os.path.exists(faa_path):
+            for record in SeqIO.parse(faa_path, "fasta"):
+                record.id = species
+                record.description = ""
+                sequences.append(record)
+                break
+    
+    # Save all sequences to one file
+    if len(sequences) == species_count:
+        output_file = os.path.join(orthologs_dir, f"{ortholog}.faa")
+        SeqIO.write(sequences, output_file, "fasta")
+        successful_orthologs += 1
+    else:
+        print(f"Warning: Ortholog {ortholog} has only {len(sequences)}/{species_count} sequences")
+
+print(f"\nSuccessfully prepared {successful_orthologs} complete orthologs")
+EOF
+
+BUSCO_DB=$BUSCO_DB python3 prepare_alignments.py
+
+# Step 4: Align sequences
+print_status "Step 4: Aligning ortholog sequences"
+
+input_dir="busco_phylogeny/individual_orthologs"
+output_dir="busco_phylogeny/aligned_orthologs"
+mkdir -p "$output_dir"
+
+total=$(ls "$input_dir"/*.faa 2>/dev/null | wc -l)
+if [ "$total" -eq 0 ]; then
+    print_error "No ortholog files found for alignment!"
+    exit 1
+fi
+
+print_status "Aligning $total orthologs..."
+
+count=0
+for file in "$input_dir"/*.faa; do
+    count=$((count + 1))
+    base=$(basename "$file" .faa)
+    
+    if [ $((count % 50)) -eq 0 ]; then
+        print_status "Progress: $count/$total alignments completed"
+    fi
+    
+    mafft --auto --quiet --thread 4 "$file" > "$output_dir/${base}_aligned.faa"
+done
+
+print_status "All alignments completed"
+
+# Step 5: Trim alignments (optional but recommended)
+print_status "Step 5: Trimming poorly aligned regions"
+
+mkdir -p busco_phylogeny/trimmed_alignments
+
+for file in busco_phylogeny/aligned_orthologs/*_aligned.faa; do
+    base=$(basename "$file" _aligned.faa)
+    trimal -in "$file" \
+           -out "busco_phylogeny/trimmed_alignments/${base}_trimmed.faa" \
+           -automated1 \
+           2>/dev/null
+done
+
+# Step 6: Concatenate alignments
+print_status "Step 6: Concatenating all alignments"
+
+cat > concatenate_alignments.py << 'EOF'
+#!/usr/bin/env python3
+from Bio import SeqIO, AlignIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+import glob
+import os
+
+# Use trimmed alignments if available, otherwise use untrimmed
+if os.path.exists("busco_phylogeny/trimmed_alignments") and \
+   len(glob.glob("busco_phylogeny/trimmed_alignments/*")) > 0:
+    aligned_dir = "busco_phylogeny/trimmed_alignments"
+    print("Using trimmed alignments")
+else:
+    aligned_dir = "busco_phylogeny/aligned_orthologs"
+    print("Using untrimmed alignments")
+
+output_dir = "busco_phylogeny"
+
+# Collect all alignments
+alignment_files = sorted(glob.glob(f"{aligned_dir}/*"))
+print(f"Found {len(alignment_files)} alignments to concatenate")
+
+# Dictionary for concatenated sequences
+concatenated = {}
+partition_info = []
+current_pos = 1
+
+# For each alignment
+for i, aln_file in enumerate(alignment_files):
+    if i % 50 == 0:
+        print(f"Processing alignment {i+1}/{len(alignment_files)}")
+    
+    # Read alignment
+    alignment = AlignIO.read(aln_file, "fasta")
+    aln_length = alignment.get_alignment_length()
+    
+    # Add partition info
+    gene_name = os.path.basename(aln_file).split("_")[0]
+    partition_info.append(f"WAG, {gene_name} = {current_pos}-{current_pos + aln_length - 1}")
+    current_pos += aln_length
+    
+    # For each sequence in alignment
+    for record in alignment:
+        species = record.id
+        if species not in concatenated:
+            concatenated[species] = ""
+        concatenated[species] += str(record.seq)
+
+# Save concatenated alignment
+print(f"\nCreating concatenated alignment...")
+records = []
+for species, seq in concatenated.items():
+    record = SeqRecord(Seq(seq), id=species, description="")
+    records.append(record)
+
+output_file = f"{output_dir}/concatenated_alignment.fasta"
+SeqIO.write(records, output_file, "fasta")
+print(f"Saved: {output_file}")
+print(f"Alignment length: {len(seq)} positions")
+print(f"Number of species: {len(records)}")
+
+# Save partition information
+with open(f"{output_dir}/partitions.txt", "w") as f:
+    for part in partition_info:
+        f.write(part + "\n")
+print(f"Saved partition information: {output_dir}/partitions.txt")
+
+# Create summary statistics
+stats_file = f"{output_dir}/alignment_stats.txt"
+with open(stats_file, "w") as f:
+    f.write(f"Concatenated alignment statistics\n")
+    f.write(f"=================================\n")
+    f.write(f"Number of species: {len(records)}\n")
+    f.write(f"Number of genes: {len(alignment_files)}\n")
+    f.write(f"Total alignment length: {len(seq)} positions\n")
+    f.write(f"\nSpecies included:\n")
+    for species in sorted(concatenated.keys()):
+        f.write(f"  - {species}\n")
+print(f"Saved statistics: {stats_file}")
+EOF
+
+python3 concatenate_alignments.py
+
+# Step 7: Build phylogenetic tree
+print_status "Step 7: Building phylogenetic tree"
+
+cd busco_phylogeny
+
+# Check if concatenated alignment exists
+if [ ! -f "concatenated_alignment.fasta" ]; then
+    print_error "Concatenated alignment not found!"
+    exit 1
+fi
+
+# Option 1: IQ-TREE (recommended)
+if command -v iqtree &> /dev/null; then
+    print_status "Running IQ-TREE analysis with model selection and bootstrap"
+    iqtree -s concatenated_alignment.fasta \
+           -B 1000 \
+           -T AUTO \
+           --seqtype AA \
+           -m MFP \
+           --prefix liverworts_tree \
+           --quiet
+    
+    print_status "IQ-TREE analysis completed!"
+    print_status "Main output files:"
+    echo "  - liverworts_tree.treefile : Final tree"
+    echo "  - liverworts_tree.contree : Consensus tree with bootstrap values"
+    echo "  - liverworts_tree.log : Analysis log"
+    
+# Option 2: FastTree (if IQ-TREE not available)
+elif command -v fasttree &> /dev/null; then
+    print_status "IQ-TREE not found, using FastTree instead"
+    fasttree -quiet concatenated_alignment.fasta > liverworts_fasttree.nwk
+    print_status "FastTree analysis completed!"
+    print_status "Output file: liverworts_fasttree.nwk"
+else
+    print_error "No tree-building software found! Please install IQ-TREE or FastTree"
+    exit 1
+fi
+
+# Final summary
+print_status "Pipeline completed successfully!"
+print_status "Results are in the 'busco_phylogeny' directory"
+
+# Display alignment statistics
+cat alignment_stats.txt
+
+# Create simple visualization script
+cat > visualize_tree.R << 'EOF'
+#!/usr/bin/env Rscript
+# Simple tree visualization script
+
+# Check if required packages are installed
+packages <- c("ape", "phangorn")
+for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        install.packages(pkg, repos = "http://cran.r-project.org")
+        library(pkg, character.only = TRUE)
+    }
+}
+
+# Find tree file
+tree_files <- c("liverworts_tree.treefile", "liverworts_tree.contree", "liverworts_fasttree.nwk")
+tree_file <- NULL
+for (tf in tree_files) {
+    if (file.exists(tf)) {
+        tree_file <- tf
+        break
+    }
+}
+
+if (is.null(tree_file)) {
+    stop("No tree file found!")
+}
+
+# Read and plot tree
+cat("Reading tree from:", tree_file, "\n")
+tree <- read.tree(tree_file)
+
+# Create PDF
+pdf("liverworts_phylogeny.pdf", width = 10, height = 8)
+plot(tree, cex = 0.8, main = "Liverwort Phylogeny (BUSCO-based)")
+add.scale.bar()
+
+# Add bootstrap values if available
+if (!is.null(tree$node.label)) {
+    nodelabels(tree$node.label, cex = 0.6, frame = "none", adj = c(1.2, -0.5))
+}
+
+dev.off()
+cat("Tree visualization saved as: liverworts_phylogeny.pdf\n")
+
+# Also create a simpler version
+pdf("liverworts_phylogeny_simple.pdf", width = 8, height = 6)
+plot(tree, type = "unrooted", cex = 0.8, main = "Liverwort Phylogeny (unrooted)")
+dev.off()
+EOF
+
+print_status "To visualize the tree, run: Rscript visualize_tree.R"
+print_status "All done!"
